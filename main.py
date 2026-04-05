@@ -1,52 +1,60 @@
-# app.py
-# Requirements: streamlit, tensorflow, numpy, pandas, matplotlib, requests, gTTS, reportlab, openai, python-dotenv
+# main.py
 
 import streamlit as st
 import os
 import io
+import base64
+import json
 from datetime import datetime
 import tensorflow as tf
 import numpy as np
 import pandas as pd
 import requests
+from PIL import Image
 from gtts import gTTS
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from openai import OpenAI
-from dotenv import load_dotenv  # ✅ For loading API keys securely
+from dotenv import load_dotenv
 
-# -------------------- Load Environment Variables --------------------
-load_dotenv()  # loads .env file from project root
+# ------------------ Load Environment ------------------
+load_dotenv()
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENWEATHER_API_KEY or not OPENAI_API_KEY:
-    st.error("❌ API keys are missing. Please create a .env file with OPENWEATHER_API_KEY and OPENAI_API_KEY.")
+    st.error("API keys missing. Add them to .env file.")
     st.stop()
 
-# -------------------- OpenAI Client --------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------- Page Config --------------------
+# ------------------ Page Setup ------------------
 st.set_page_config(page_title="Plant Disease Recognition", layout="wide")
 
-# -------------------- Load Model --------------------
+# ------------------ Load Model ------------------
 @st.cache_resource
 def load_model():
-    return tf.keras.models.load_model("trained_plant_disease_model.keras")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, "trained_plant_disease_model01.keras")
+    if not os.path.exists(model_path):
+        st.error(f"Model not found: {model_path}")
+        st.stop()
+    return tf.keras.models.load_model(model_path)
 
 model = load_model()
 
-# -------------------- Prediction --------------------
+
+# ------------------ Prediction ------------------
 def model_prediction(image_file):
     img = tf.keras.preprocessing.image.load_img(image_file, target_size=(128, 128))
-    arr = tf.keras.preprocessing.image.img_to_array(img)
-    arr = np.expand_dims(arr, axis=0)
-    preds = model.predict(arr)[0]
-    return preds
+    img_array = tf.keras.preprocessing.image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    prediction = model.predict(img_array)[0]
+    return prediction
 
-# -------------------- Class Names --------------------
+
+# ------------------ Class Labels ------------------
 CLASS_NAMES = [
     'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
     'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew',
@@ -60,207 +68,304 @@ CLASS_NAMES = [
     'Strawberry___Leaf_scorch', 'Strawberry___healthy', 'Tomato___Bacterial_spot',
     'Tomato___Early_blight', 'Tomato___Late_blight', 'Tomato___Leaf_Mold',
     'Tomato___Septoria_leaf_spot', 'Tomato___Spider_mites Two-spotted_spider_mite',
-    'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus',
-    'Tomato___healthy'
+    'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
+    'Tomato___Tomato_mosaic_virus', 'Tomato___healthy'
 ]
+
 
 def clean_label(label):
     return label.replace("___", " ").replace("_", " ").title()
 
-# -------------------- Weather --------------------
-def get_weather_for_city(city_name):
-    try:
-        url = f"http://api.openweathermap.org/data/2.5/weather?q={city_name}&appid={OPENWEATHER_API_KEY}&units=metric"
-        r = requests.get(url, timeout=6)
-        data = r.json()
-        if r.status_code != 200 or "main" not in data:
-            return f"Weather not found for '{city_name}'"
-        temp = data["main"]["temp"]
-        cond = data["weather"][0]["description"].capitalize()
-        return f"{temp}°C, {cond}"
-    except Exception as e:
-        return f"Error fetching weather: {e}"
 
-# -------------------- TTS --------------------
-def tts_gtts(text):
-    try:
-        tts = gTTS(text=text, lang="en")
-        fp = io.BytesIO()
-        tts.write_to_fp(fp)
-        fp.seek(0)
-        return fp.read()
-    except:
-        return None
-
-# -------------------- PDF Generator --------------------
-def generate_pdf_bytes(disease_name, content):
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(40, height - 60, f"Disease: {disease_name}")
-    c.setFont("Helvetica", 12)
-    text = c.beginText(40, height - 100)
-    for line in content.split(". "):
-        text.textLine(line)
-    c.drawText(text)
-    c.showPage()
-    c.save()
-    buf.seek(0)
-    return buf.read()
-
-# -------------------- AI Disease Solution --------------------
-def ai_generate_solution(disease_name):
-    prompt = f"""
-    You are an agricultural expert. Explain the plant disease '{disease_name}' in 3 short parts:
-    1. What it is and symptoms
-    2. Causes
-    3. Treatment & prevention (natural + modern methods)
-    Use simple English.
+# ------------------ Layer 1: Vision API Leaf Validator ------------------
+def validate_leaf_with_vision(image_bytes: bytes) -> tuple:
+    """
+    Uses GPT-4o vision to check if image is a plant leaf.
+    Returns (is_leaf: bool, reason: str, api_success: bool)
     """
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful agricultural assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=350,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error generating AI response: {e}"
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-# -------------------- AI ChatBot --------------------
-def agri_chatbot_response(question):
-    prompt = f"You are a smart Indian agriculture assistant. Answer this farmer’s question in simple English:\n\nQ: {question}\nA:"
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict plant leaf image validator. "
+                        "Look at the image carefully and determine if it shows a plant leaf or leaves. "
+                        "Only respond with a JSON object in this exact format with no extra text: "
+                        '{"is_leaf": true or false, "reason": "one short sentence"}'
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_image}",
+                                "detail": "low"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Is this a plant leaf image? Reply ONLY with the JSON."
+                        }
+                    ]
+                }
+            ],
+            max_tokens=100
+        )
+
+        content = response.choices[0].message.content.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(content)
+        return bool(result.get("is_leaf", False)), result.get("reason", "Unknown"), True
+
+    except Exception as e:
+        # API failed — signal to use fallback
+        return False, str(e), False
+
+
+# ------------------ Layer 2: Pixel-based Leaf Validator (Fallback) ------------------
+def validate_leaf_with_pixels(image_bytes: bytes) -> tuple:
+    """
+    Fallback validator using green/brown/yellow pixel ratio analysis.
+    Plant leaves have significant green channel dominance.
+    Returns (is_leaf: bool, reason: str)
+    """
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are an expert in Indian agriculture, helping farmers."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=300,
-            temperature=0.7
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error: {e}"
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = img.resize((100, 100))
+        pixels = np.array(img, dtype=float)
 
-# -------------------- Streamlit UI --------------------
+        R = pixels[:, :, 0]
+        G = pixels[:, :, 1]
+        B = pixels[:, :, 2]
+
+        # Green dominance (healthy leaf)
+        green_dominant = (G > R) & (G > B)
+        green_ratio = np.sum(green_dominant) / (100 * 100)
+
+        # Yellow tones (stressed/diseased leaf)
+        yellow_dominant = (R > 100) & (G > 100) & (B < 100) & (G >= R * 0.7)
+        yellow_ratio = np.sum(yellow_dominant) / (100 * 100)
+
+        # Brown tones (diseased/dry leaf)
+        brown_dominant = (R > 80) & (G > 40) & (G < R * 0.85) & (B < 80)
+        brown_ratio = np.sum(brown_dominant) / (100 * 100)
+
+        leaf_color_ratio = green_ratio + (yellow_ratio * 0.5) + (brown_ratio * 0.3)
+
+        if leaf_color_ratio >= 0.15:
+            return True, f"Image contains {leaf_color_ratio*100:.0f}% leaf-like colors"
+        else:
+            return False, f"Only {leaf_color_ratio*100:.0f}% leaf-like colors detected — does not appear to be a plant leaf"
+
+    except Exception as e:
+        return True, f"Pixel check failed: {e}"  # fail open to avoid blocking real users
+
+
+# ------------------ Combined Validator ------------------
+def is_plant_leaf(image_bytes: bytes) -> tuple:
+    """
+    Tries GPT-4o vision first. Falls back to pixel color analysis if API fails.
+    Returns (is_leaf: bool, reason: str, method: str)
+    """
+    is_leaf, reason, api_success = validate_leaf_with_vision(image_bytes)
+
+    if api_success:
+        return is_leaf, reason, "AI Vision"
+    else:
+        # Vision API failed — use pixel fallback
+        is_leaf, reason = validate_leaf_with_pixels(image_bytes)
+        return is_leaf, reason, "Color Analysis (fallback)"
+
+
+# ------------------ Weather ------------------
+def get_weather(city):
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
+        r = requests.get(url).json()
+        temp = r["main"]["temp"]
+        cond = r["weather"][0]["description"]
+        return f"{temp}°C , {cond}"
+    except:
+        return "Weather not found"
+
+
+# ------------------ Text to Speech ------------------
+def text_to_speech(text):
+    tts = gTTS(text=text, lang="en")
+    fp = io.BytesIO()
+    tts.write_to_fp(fp)
+    fp.seek(0)
+    return fp.read()
+
+
+# ------------------ PDF Generator ------------------
+def generate_pdf(disease, text):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, height - 60, f"Disease: {disease}")
+    c.setFont("Helvetica", 12)
+    text_obj = c.beginText(40, height - 100)
+    for line in text.split("."):
+        text_obj.textLine(line)
+    c.drawText(text_obj)
+    c.save()
+    buffer.seek(0)
+    return buffer.read()
+
+
+# ------------------ AI Solution ------------------
+def ai_solution(disease):
+    prompt = f"""
+    Explain plant disease {disease}.
+    
+    1 Symptoms
+    2 Causes
+    3 Treatment and prevention
+    
+    Use simple language for farmers.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are agriculture expert"},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=300
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ------------------ Chatbot ------------------
+def agri_chat(question):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are helpful Indian agriculture assistant"},
+            {"role": "user", "content": question}
+        ],
+        max_tokens=300
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ------------------ Sidebar ------------------
 st.sidebar.title("🌿 Smart Plant Assistant")
 
-app_mode = st.sidebar.radio(
-    "Navigate",
-    ["🏠 Home", "ℹ️ About", "🔬 Disease Recognition", "🤖 Smart Agri ChatBot"]
+mode = st.sidebar.radio(
+    "Navigation",
+    ["Home", "About", "Disease Recognition", "Agri Chatbot"]
 )
 
-city = st.sidebar.text_input("Enter city for weather", "Pune")
-if city:
-    st.sidebar.info(get_weather_for_city(city))
+city = st.sidebar.text_input("Enter City", "Pune")
+st.sidebar.info(get_weather(city))
 
 if "history" not in st.session_state:
     st.session_state.history = []
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# -------------------- HOME --------------------
-if app_mode == "🏠 Home":
+
+# ------------------ Home ------------------
+if mode == "Home":
     st.title("🌱 Plant Disease Recognition System")
-    st.write("Upload or capture a leaf image to identify diseases and get AI-based treatment suggestions.")
+    st.write("Upload a plant leaf image to detect disease")
     if os.path.exists("home_page.jpeg"):
         st.image("home_page.jpeg", use_column_width=True)
 
-# -------------------- ABOUT --------------------
-elif app_mode == "ℹ️ About":
-    st.header("About the Project")
+
+# ------------------ About ------------------
+elif mode == "About":
+    st.header("About")
     st.info("""
-    🌿 **Plant Disease Recognition System** uses a Convolutional Neural Network (CNN)
-    trained on the PlantVillage dataset to identify crop diseases.
+    CNN based Plant Disease Detection system.
     
-    💡 Integrated with OpenAI to provide smart disease treatments and a farming chatbot.
+    Uses PlantVillage dataset.
+    
+    AI provides disease solution and farming chatbot.
     """)
-    if st.sidebar.checkbox("📜 Show Prediction History"):
-        if st.session_state.history:
-            st.dataframe(pd.DataFrame(st.session_state.history))
-        else:
-            st.info("No predictions yet.")
+    if st.session_state.history:
+        st.dataframe(pd.DataFrame(st.session_state.history))
 
-# -------------------- DISEASE RECOGNITION --------------------
-elif app_mode == "🔬 Disease Recognition":
-    st.header("🔍 Detect Plant Disease")
 
-    col1, col2 = st.columns([1.5, 1])
-    with col1:
-        uploaded_file = st.file_uploader("📸 Upload a Leaf Image", type=["jpg", "jpeg", "png"])
-    with col2:
-        camera_image = st.camera_input("Or Capture from Camera")
+# ------------------ Disease Recognition ------------------
+elif mode == "Disease Recognition":
+    st.header("Detect Plant Disease")
 
-    image_source = uploaded_file or camera_image
+    uploaded_file = st.file_uploader("Upload Leaf Image", type=["jpg", "png", "jpeg"])
+    camera_img = st.camera_input("Or Capture Image")
 
-    if image_source:
-        st.image(image_source, caption="Input Image", use_column_width=True)
+    img = uploaded_file or camera_img
 
-        if st.button("🚀 Predict Disease", use_container_width=True):
-            with st.spinner("Analyzing image..."):
-                preds = model_prediction(image_source)
-            top_idx = np.argmax(preds)
-            clean_name = clean_label(CLASS_NAMES[top_idx])
-            confidence = preds[top_idx] * 100
-            st.success(f"🌱 Disease: {clean_name}")
-            st.info(f"🎯 Confidence: {confidence:.2f}%")
-            st.session_state.last_prediction = clean_name
-            st.session_state.history.append({
-                "Time": str(datetime.now()),
-                "Prediction": clean_name,
-                "Confidence": f"{confidence:.2f}%"
-            })
-            st.balloons()
+    if img:
+        st.image(img, width=300)
 
-        if "last_prediction" in st.session_state:
-            st.write("---")
-            if st.button("💡 View Solution", use_container_width=True):
-                with st.spinner("Generating AI-based explanation..."):
-                    ai_response = ai_generate_solution(st.session_state.last_prediction)
-                st.subheader("🧠 AI Disease Insights")
-                st.markdown(ai_response)
-                audio_data = tts_gtts(ai_response)
-                if audio_data:
-                    st.audio(audio_data, format="audio/mp3")
-                pdf_bytes = generate_pdf_bytes(st.session_state.last_prediction, ai_response)
-                st.download_button(
-                    "📥 Download Solution as PDF",
-                    pdf_bytes,
-                    file_name=f"{st.session_state.last_prediction}_solution.pdf"
-                )
+        if st.button("Predict"):
 
-        if st.button("🧹 Clear", use_container_width=True):
-            st.session_state.clear()
-            st.experimental_rerun()
-    else:
-        st.warning("Please upload or capture an image to proceed.")
+            # ---- Step 1: Validate it's a leaf ----
+            with st.spinner("🔍 Checking if image is a plant leaf..."):
+                image_bytes = img.getvalue()
+                leaf_valid, reason, method = is_plant_leaf(image_bytes)
 
-# -------------------- CHATBOT --------------------
-elif app_mode == "🤖 Smart Agri ChatBot":
-    st.header("🤖 Smart Agriculture ChatBot")
-    st.write("Ask any question about farming, crop care, fertilizers, irrigation, or weather 🌾")
+            if not leaf_valid:
+                st.error("❌ This does not appear to be a plant leaf image!")
+                st.warning(f"**Reason:** {reason}")
+                st.info("💡 Please upload a clear photo of a plant leaf (tomato, potato, apple, etc.)")
 
-    # Display previous conversation
-    for chat in st.session_state.chat_history:
-        if chat["role"] == "user":
-            st.markdown(f"**You:** {chat['content']}")
-        else:
-            st.markdown(f"**AI:** {chat['content']}")
+            else:
+                st.success(f"✅ Leaf confirmed ({method})")
 
-    # Input box for new question
-    user_question = st.text_input("Type your question here and press Enter")
-    if user_question:
-        # Append user question to history
-        st.session_state.chat_history.append({"role": "user", "content": user_question})
-        # Generate AI response
-        with st.spinner("Thinking..."):
-            response = agri_chatbot_response(user_question)
-        st.session_state.chat_history.append({"role": "assistant", "content": response})
-        # Display response
-        st.markdown(f"**AI:** {response}")
+                # ---- Step 2: Run disease prediction ----
+                with st.spinner("🧪 Analyzing leaf for disease..."):
+                    img.seek(0)
+                    preds = model_prediction(img)
+
+                idx = np.argmax(preds)
+                disease = clean_label(CLASS_NAMES[idx])
+                confidence = preds[idx] * 100
+
+                if confidence < 60:
+                    st.warning(f"⚠️ Low confidence ({confidence:.2f}%) — try a clearer, closer leaf photo.")
+                else:
+                    st.success(f"🌿 Disease: **{disease}**")
+
+                st.info(f"Confidence: {confidence:.2f}%")
+
+                st.session_state.last_prediction = disease
+                st.session_state.history.append({
+                    "Time": str(datetime.now()),
+                    "Prediction": disease,
+                    "Confidence": f"{confidence:.2f}%"
+                })
+
+    if "last_prediction" in st.session_state:
+        if st.button("Get AI Solution"):
+            solution = ai_solution(st.session_state.last_prediction)
+            st.markdown(solution)
+
+            audio = text_to_speech(solution)
+            st.audio(audio)
+
+            pdf = generate_pdf(st.session_state.last_prediction, solution)
+            st.download_button(
+                "Download PDF",
+                pdf,
+                file_name="disease_solution.pdf"
+            )
+
+
+# ------------------ Chatbot ------------------
+elif mode == "Agri Chatbot":
+    st.header("Agriculture Chatbot")
+    question = st.text_input("Ask farming question")
+    if question:
+        answer = agri_chat(question)
+        st.write(answer)
